@@ -1,10 +1,37 @@
 import os
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+
+# Custom kernel functions
+def kernel_laplacian(X, Y):
+    """Laplacian (L1-RBF) — more robust to outliers than Gaussian RBF"""
+    from sklearn.metrics.pairwise import manhattan_distances
+    gamma = 1.0 / X.shape[1]
+    return np.exp(-gamma * manhattan_distances(X, Y))
+
+def kernel_rational_quadratic(X, Y):
+    """Rational Quadratic — mixture of RBFs at different scales"""
+    alpha, c = 1.0, 1.0
+    from sklearn.metrics.pairwise import euclidean_distances
+    D2 = euclidean_distances(X, Y) ** 2
+    return (1 - D2 / (D2 + c)) ** alpha
+
+def kernel_anova(X, Y, sigma=1.0, d=2):
+    """ANOVA kernel — captures feature interaction effects"""
+    K = np.zeros((X.shape[0], Y.shape[0]))
+    for k in range(X.shape[1]):
+        K += np.exp(-sigma * (X[:, k:k+1] - Y[:, k].reshape(1, -1)) ** 2) ** d
+    return K
+
+def kernel_cosine_custom(X, Y):
+    """Cosine similarity — useful when direction matters more than magnitude"""
+    from sklearn.metrics.pairwise import cosine_similarity
+    return cosine_similarity(X, Y)
 
 
 FEATURE_COLUMNS = [
@@ -28,7 +55,6 @@ MODEL_OPTIONS = {
     "SVM Laplacian": "models/svm_laplacian.joblib",
     "SVM Rational Quadratic": "models/svm_rational_quadratic.joblib",
     "GAM": "models/gam.joblib",
-    "Spline": "models/spline.joblib",
     "Gradient Boosting": "models/gradientboosting.joblib",
 }
 
@@ -78,19 +104,19 @@ TEAM_COLORS = {
 
 ARENA_THEMES = {
     "Prime Time": {
-        "background": "https://images.unsplash.com/photo-1546519638-68e109498ffc?auto=format&fit=crop&w=1800&q=80",
-        "overlay_start": "rgba(4, 10, 26, 0.78)",
-        "overlay_end": "rgba(8, 22, 52, 0.86)",
+        "background": "https://c4.wallpaperflare.com/wallpaper/441/390/498/basketball-lebron-james-nba-wallpaper-preview.jpg",
+        "overlay_start": "rgba(4, 10, 26, 0.86)",
+        "overlay_end": "rgba(8, 22, 52, 0.93)",
     },
     "Hardwood Classic": {
-        "background": "https://images.unsplash.com/photo-1518063319789-7217e6706b04?auto=format&fit=crop&w=1800&q=80",
-        "overlay_start": "rgba(28, 17, 7, 0.74)",
-        "overlay_end": "rgba(60, 34, 12, 0.82)",
+        "background": "https://c4.wallpaperflare.com/wallpaper/441/390/498/basketball-lebron-james-nba-wallpaper-preview.jpg",
+        "overlay_start": "rgba(28, 17, 7, 0.84)",
+        "overlay_end": "rgba(60, 34, 12, 0.91)",
     },
     "Playoff Lights": {
-        "background": "https://images.unsplash.com/photo-1519861531473-9200262188bf?auto=format&fit=crop&w=1800&q=80",
-        "overlay_start": "rgba(14, 11, 4, 0.72)",
-        "overlay_end": "rgba(66, 43, 10, 0.84)",
+        "background": "https://c4.wallpaperflare.com/wallpaper/441/390/498/basketball-lebron-james-nba-wallpaper-preview.jpg",
+        "overlay_start": "rgba(14, 11, 4, 0.84)",
+        "overlay_end": "rgba(66, 43, 10, 0.92)",
     },
 }
 
@@ -174,6 +200,119 @@ def build_input_dataframe(inputs: Dict[str, float]) -> pd.DataFrame:
     return pd.DataFrame([[inputs[col] for col in FEATURE_COLUMNS]], columns=FEATURE_COLUMNS)
 
 
+def call_model_method_with_fallback(model: Any, method_name: str, input_df: pd.DataFrame):
+    method = getattr(model, method_name, None)
+    if method is None:
+        return None
+
+    try:
+        return method(input_df)
+    except Exception as first_exc:
+        # Some serialized models use NumPy-style indexing (X[:, i:j]) and fail on DataFrames.
+        try:
+            return method(input_df.to_numpy(dtype=float))
+        except Exception:
+            raise first_exc
+
+
+def _normalize_label(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def infer_home_win_class(model: Any) -> Optional[Any]:
+    classes = getattr(model, "classes_", None)
+    if classes is None:
+        return None
+
+    class_list = [_normalize_label(cls) for cls in np.ravel(classes)]
+
+    for cls in class_list:
+        if isinstance(cls, str):
+            label = cls.strip().lower()
+            if "home" in label and "win" in label:
+                return cls
+
+    for cls in class_list:
+        if isinstance(cls, (bool, np.bool_)) and bool(cls):
+            return cls
+
+    for cls in class_list:
+        if isinstance(cls, (int, float, np.integer, np.floating)) and np.isclose(float(cls), 1.0):
+            return cls
+
+    return None
+
+
+def is_home_win_prediction(model: Any, raw_prediction: Any) -> bool:
+    prediction = _normalize_label(raw_prediction)
+    home_win_class = infer_home_win_class(model)
+
+    if home_win_class is not None:
+        return prediction == home_win_class
+
+    if isinstance(prediction, str):
+        label = prediction.strip().lower()
+        if "away" in label and "win" in label:
+            return False
+        if "home" in label and "win" in label:
+            return True
+        if "loss" in label:
+            return False
+        if "win" in label:
+            return True
+
+    if isinstance(prediction, (bool, np.bool_)):
+        return bool(prediction)
+
+    if isinstance(prediction, (int, float, np.integer, np.floating)):
+        return np.isclose(float(prediction), 1.0)
+
+    return bool(prediction)
+
+
+def extract_home_win_probability(model: Any, proba: np.ndarray) -> Optional[float]:
+    if proba.ndim != 2 or proba.shape[1] < 2:
+        return None
+
+    classes = getattr(model, "classes_", None)
+    if classes is not None:
+        class_list = [_normalize_label(cls) for cls in np.ravel(classes)]
+        if len(class_list) == proba.shape[1]:
+            home_win_class = infer_home_win_class(model)
+            if home_win_class is not None and home_win_class in class_list:
+                home_idx = class_list.index(home_win_class)
+                return float(proba[0, home_idx])
+
+            if 1 in class_list:
+                return float(proba[0, class_list.index(1)])
+
+            if True in class_list:
+                return float(proba[0, class_list.index(True)])
+
+    return float(proba[0, 1])
+
+
+def extract_home_win_probability_from_decision(model: Any, score: float, is_home_win: bool) -> float:
+    positive_class_probability = float(1.0 / (1.0 + np.exp(-score)))
+
+    classes = getattr(model, "classes_", None)
+    if classes is not None:
+        class_list = [_normalize_label(cls) for cls in np.ravel(classes)]
+        if len(class_list) == 2:
+            home_win_class = infer_home_win_class(model)
+            if home_win_class is not None and home_win_class in class_list:
+                return positive_class_probability if class_list[1] == home_win_class else float(1.0 - positive_class_probability)
+
+    # Fallback: force consistency between class label and displayed percentages.
+    if is_home_win and positive_class_probability < 0.5:
+        return float(1.0 - positive_class_probability)
+    if (not is_home_win) and positive_class_probability > 0.5:
+        return float(1.0 - positive_class_probability)
+    return positive_class_probability
+
+
 def team_primary_color(team: str) -> str:
     return TEAM_COLORS.get(team, "#1D428A")
 
@@ -211,8 +350,8 @@ def inject_nba_theme(home_team: str, away_team: str, theme_name: str) -> None:
         }}
 
         .main .block-container {{
-            background: rgba(7, 15, 31, 0.70);
-            border: 1px solid rgba(255, 255, 255, 0.14);
+            background: rgba(7, 15, 31, 0.90);
+            border: 1px solid rgba(255, 255, 255, 0.22);
             border-radius: 20px;
             padding-top: 2.1rem;
             padding-bottom: 1.8rem;
@@ -240,8 +379,8 @@ def inject_nba_theme(home_team: str, away_team: str, theme_name: str) -> None:
         }}
 
         div[data-testid="stMetric"] {{
-            background: rgba(255, 255, 255, 0.08);
-            border: 1px solid rgba(255, 255, 255, 0.2);
+            background: #11284f;
+            border: 1px solid #355c97;
             border-radius: 14px;
             padding: 0.6rem 0.9rem;
         }}
@@ -267,25 +406,25 @@ def inject_nba_theme(home_team: str, away_team: str, theme_name: str) -> None:
         .stNumberInput input,
         textarea,
         input {{
-            background-color: rgba(255, 255, 255, 0.08) !important;
+            background-color: rgba(15, 37, 71, 0.90) !important;
             color: #F8FAFF !important;
             border-radius: 10px !important;
-            border: 1px solid rgba(255, 255, 255, 0.18) !important;
+            border: 1px solid rgba(255, 255, 255, 0.30) !important;
         }}
 
         .stSlider [data-baseweb="slider"] > div {{
-            background-color: rgba(255, 255, 255, 0.20);
+            background-color: rgba(255, 255, 255, 0.36);
         }}
 
         [data-testid="stDataFrame"] {{
-            background: rgba(255, 255, 255, 0.06);
+            background: rgba(14, 30, 60, 0.88);
             border-radius: 14px;
-            border: 1px solid rgba(255, 255, 255, 0.16);
+            border: 1px solid rgba(255, 255, 255, 0.25);
         }}
 
         .hero-board {{
-            background: linear-gradient(120deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.05));
-            border: 1px solid rgba(255, 255, 255, 0.2);
+            background: #0e2346;
+            border: 1px solid #355c97;
             border-radius: 18px;
             padding: 1rem 1.2rem;
             margin: 0.4rem 0 1.1rem;
@@ -319,8 +458,8 @@ def inject_nba_theme(home_team: str, away_team: str, theme_name: str) -> None:
         .hero-chip {{
             padding: 0.35rem 0.58rem;
             border-radius: 999px;
-            background: rgba(255, 255, 255, 0.12);
-            border: 1px solid rgba(255, 255, 255, 0.18);
+            background: rgba(34, 65, 114, 0.95);
+            border: 1px solid rgba(255, 255, 255, 0.28);
             font-size: 0.8rem;
             color: #F5F8FF;
             white-space: nowrap;
@@ -362,19 +501,33 @@ def render_matchup_banner(home_team: str, away_team: str, model_name: str, theme
     )
 
 
-def predict_outcome(model, input_df: pd.DataFrame) -> Tuple[int, Optional[float]]:
-    prediction = int(model.predict(input_df)[0])
+def predict_outcome(model, input_df: pd.DataFrame) -> Tuple[bool, Optional[float]]:
+    pred_values = call_model_method_with_fallback(model, "predict", input_df)
+    if pred_values is None:
+        raise AttributeError("Model does not implement predict().")
+
+    prediction = np.ravel(pred_values)[0]
+    is_home_win = is_home_win_prediction(model, prediction)
 
     probability: Optional[float] = None
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(input_df)
-        if proba.ndim == 2 and proba.shape[1] >= 2:
-            probability = float(proba[0, 1])
-    elif hasattr(model, "decision_function"):
-        score = float(np.ravel(model.decision_function(input_df))[0])
-        probability = float(1.0 / (1.0 + np.exp(-score)))
+    proba = call_model_method_with_fallback(model, "predict_proba", input_df)
+    if proba is not None:
+        probability = extract_home_win_probability(model, np.asarray(proba))
+    else:
+        decision = call_model_method_with_fallback(model, "decision_function", input_df)
+        if decision is None:
+            return is_home_win, probability
 
-    return prediction, probability
+        score = float(np.ravel(decision)[0])
+        probability = extract_home_win_probability_from_decision(model, score, is_home_win)
+
+    if probability is not None:
+        if is_home_win and probability < 0.5:
+            probability = float(1.0 - probability)
+        elif (not is_home_win) and probability > 0.5:
+            probability = float(1.0 - probability)
+
+    return is_home_win, probability
 
 
 def render_feature_inputs(config: Dict[str, Dict[str, float]]) -> Dict[str, float]:
@@ -431,7 +584,8 @@ def main() -> None:
     st.sidebar.header("Matchup Setup")
     home_team = st.sidebar.selectbox("Home Team", NBA_TEAMS, index=1)
     away_team = st.sidebar.selectbox("Away Team", NBA_TEAMS, index=2)
-    theme_name = st.sidebar.selectbox("Arena Theme", list(ARENA_THEMES.keys()), index=0)
+    theme_name = "Prime Time"
+    st.sidebar.caption("Theme: Prime Time")
 
     if home_team == away_team:
         st.sidebar.warning("Please select two different teams.")
@@ -475,17 +629,11 @@ def main() -> None:
         input_df = build_input_dataframe(feature_values)
 
         try:
-            pred_class, pred_prob = predict_outcome(model, input_df)
+            is_home_win, pred_prob = predict_outcome(model, input_df)
         except Exception as exc:
             st.error(f"Prediction failed: {exc}")
             st.stop()
 
-        result_label = "Home Win" if pred_class == 1 else "Home Loss"
-
-        if pred_class == 1:
-            st.success(f"Classification Result: {result_label} ({home_team} projected to win)")
-        else:
-            st.warning(f"Classification Result: {result_label} ({away_team} projected to win)")
 
         if pred_prob is not None:
             home_prob = pred_prob
